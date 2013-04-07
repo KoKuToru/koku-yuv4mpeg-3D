@@ -1,8 +1,132 @@
 #include <framework.h>
 #include <iostream>
 #include <string>
-using namespace std;
 
+const char* fragment_shader = R"glsl(
+
+#version 400
+layout(location = 0) out vec4 FragColor;
+in vec2 pos_fg;
+layout(origin_upper_left) in vec4 gl_FragCoord;
+
+uniform sampler2D frame;
+uniform int frame_mode_in;
+uniform int frame_mode_out;
+void main()
+{
+	FragColor = vec4(0,0,0,0);
+	switch(frame_mode_out)
+	{
+		case 0:
+			switch(frame_mode_in)
+			{
+				case 0:
+					FragColor = texture2D(frame, pos_fg);
+					break;
+				case 1:
+					FragColor = texture2D(frame, vec2(pos_fg.x/2, pos_fg.y));
+					break;
+				case 2:
+					FragColor = texture2D(frame, vec2(pos_fg.x, pos_fg.y/2));
+					break;
+			}
+			break;
+		case 1:
+			if (pos_fg.x < 0.5)
+			{
+				switch(frame_mode_in)
+				{
+					case 1:
+						FragColor = texture2D(frame, pos_fg);
+						break;
+					case 2:
+						FragColor = texture2D(frame, vec2(pos_fg.x*2, pos_fg.y/2));
+						break;
+				}
+			}
+			else
+			{
+				switch(frame_mode_in)
+				{
+					case 1:
+						FragColor = texture2D(frame, pos_fg);
+						break;
+					case 2:
+						FragColor = texture2D(frame, vec2(pos_fg.x*2, 0.5+pos_fg.y/2));
+						break;
+				}
+			}
+			break;
+		case 2:
+			if (pos_fg.y < 0.5)
+			{
+				switch(frame_mode_in)
+				{
+					case 1:
+						FragColor = texture2D(frame, vec2(pos_fg.x/2.0, pos_fg.y*2.0));
+						break;
+					case 2:
+						FragColor = texture2D(frame, pos_fg);
+						break;
+				}
+			}
+			else
+			{
+				switch(frame_mode_in)
+				{
+					case 1:
+						FragColor = texture2D(frame, vec2(0.5+pos_fg.x/2.0, pos_fg.y*2.0));
+						break;
+					case 2:
+						FragColor = texture2D(frame, pos_fg);
+						break;
+				}
+			}
+			break;
+		case 3:
+			if (mod(gl_FragCoord.y, 2.0) < 1.0)
+			{
+				switch(frame_mode_in)
+				{
+					case 1:
+						FragColor = texture2D(frame, vec2(pos_fg.x/2.0, pos_fg.y));
+						break;
+					case 2:
+						FragColor = texture2D(frame, vec2(pos_fg.x, pos_fg.y/2));
+						break;
+				}
+			}
+			else
+			{
+				switch(frame_mode_in)
+				{
+					case 1:
+						FragColor = texture2D(frame, vec2(0.5+pos_fg.x/2.0, pos_fg.y));
+						break;
+					case 2:
+						FragColor = texture2D(frame, vec2(pos_fg.x, 0.5+pos_fg.y/2));
+						break;
+				}
+			}
+			break;
+		case 4:
+			//not yet
+			break;
+	}
+
+	//YUV TO RGB
+	float y = FragColor.r;
+	float u = FragColor.g - 0.5;
+	float v = FragColor.b - 0.5;
+	float r = y + 1.402 * v;
+	float g = y - 0.344 * u - 0.714 * v;
+	float b = y + 1.772 * u;
+	FragColor = vec4(r,g,b,1);
+}
+
+)glsl";
+
+using namespace std;
 
 class window: public koku::opengl::windowCallback
 {
@@ -12,11 +136,27 @@ class window: public koku::opengl::windowCallback
 		koku::opengl::texture my_frame;
 		koku::opengl::shader  my_shader;  //will take left/right and render it right
 		koku::opengl::shader_uniform my_frame_sampler;
+		koku::opengl::shader_uniform my_frame_mode_input;
+		koku::opengl::shader_uniform my_frame_mode_output;
+		koku::opengl::shader_uniform my_frame_ratio;
+
+		/* FRAME MODES */
+		//0 NONE
+		//1 LEFT_RIGHT
+		//2 TOP_BOTTOM
+		//3 COL
+		//4 ROW
+
 		bool run;
 		int frame_w;
 		int frame_h;
 		unsigned char *frame_data;
 		unsigned char *frame_data_unpacked;
+
+		int frame_mode_input;
+		int frame_mode_output;
+
+		float frame_ratio;
 
 	protected:
 		void onQuit()
@@ -24,18 +164,38 @@ class window: public koku::opengl::windowCallback
 			run = false;
 		}
 
+		void onResize(int width, int height)
+		{
+			//reset
+			glViewport(0, 0, width, height);
+
+			frame_ratio = ((float(frame_w)/float(frame_h))*float(height))/float(width);
+		}
+
 	public:
-		window():
-			my_window(this, "koku-yuv4mpeg-3D", 640, 480, true),
+		~window()
+		{
+			delete[] frame_data;
+			delete[] frame_data_unpacked;
+		}
+
+		window(int frame_mode_input, int frame_mode_output):
+			my_window(this, "koku-yuv4mpeg-3D", 640, 480, true, true),
 			my_rect(&my_window),
 			my_frame(&my_window),
 			my_shader(&my_window),
 			my_frame_sampler("frame"),
+			my_frame_mode_input("frame_mode_in"),
+			my_frame_mode_output("frame_mode_out"),
+			my_frame_ratio("frame_ratio"),
 			run(true),
 			frame_w(-1),
 			frame_h(-1),
 			frame_data(0),
-			frame_data_unpacked(0)
+			frame_data_unpacked(0),
+			frame_mode_input(frame_mode_input),
+			frame_mode_output(frame_mode_output),
+			frame_ratio(1)
 		{
 			const float vertex[]=
 			{
@@ -56,29 +216,19 @@ class window: public koku::opengl::windowCallback
 			my_shader.uploadVertex("#version 400\n"
 								   "layout(location = 0) in vec2 pos;\n"
 								   "out vec2 pos_fg;\n"
+								   "uniform float frame_ratio;\n"
 								   "void main()\n"
 								   "{\n"
 								   "	pos_fg = (pos+vec2(1.0,1.0))/2.0;\n"
 								   "	pos_fg.y = 1.0-pos_fg.y;\n"
-								   "	gl_Position = vec4(pos, 0, 1);\n"
+								   "	if (frame_ratio <= 1) \n"
+								   "	gl_Position = vec4(pos.x*frame_ratio, pos.y, 0, 1);\n"
+								   "	else\n"
+								   "	gl_Position = vec4(pos.x, pos.y/frame_ratio, 0, 1);\n"
 								   "}\n");
 
-			my_shader.uploadFragment("#version 400\n"
-									 "layout(location = 0) out vec4 FragColor;\n"
-									 "in vec2 pos_fg;\n"
-									 "uniform sampler2D frame;\n"
-									 "void main()\n"
-									 "{\n"
-									 "	FragColor = texture2D(frame, pos_fg);\n"
-									 //YUV TO RGB
-									 "	float y = FragColor.r;\n"
-									 "	float u = FragColor.g - 0.5;\n"
-									 "	float v = FragColor.b - 0.5;\n"
-									 "	float r = y + 1.402 * v;\n"
-									 "	float g = y - 0.344 * u - 0.714 * v;\n"
-									 "	float b = y + 1.772 * u;\n"
-									 "	FragColor = vec4(r,g,b,1);\n"
-									 "}\n");
+			my_shader.uploadFragment(fragment_shader);
+
 			my_shader.compile();
 
 			//upload dummy texture
@@ -94,35 +244,36 @@ class window: public koku::opengl::windowCallback
 
 			my_frame.upload(image, 16, 16, 3);
 
-			delete image;
+			delete[] image;
+
+			//get data from yuv4mpeg
+			//setup
+			char c;
+			cin >> c;
+			if (c != 'W')
+			{
+				cout << "YUV4MPEG2 File is wrong ! - Waiting for W" << endl;
+				return;
+			}
+			cin >> frame_w;
+
+			cin >> c;
+			if (c != 'H')
+			{
+				cout << "YUV4MPEG2 File is wrong ! - Waiting for H" << endl;
+				return;
+			}
+			cin >> frame_h;
+
+			frame_data = new unsigned char[frame_w*frame_h*3/2];
+			frame_data_unpacked = new unsigned char[frame_w*frame_h*3];
+
+			onResize(640, 480);
 		}
 
 		bool update()
 		{
 			//get data from yuv4mpeg
-			if (frame_w == -1)
-			{
-				//setup
-				char c;
-				cin >> c;
-				if (c != 'W')
-				{
-					cout << "YUV4MPEG2 File is wrong ! - Waiting for W" << endl;
-					return false;
-				}
-				cin >> frame_w;
-
-				cin >> c;
-				if (c != 'H')
-				{
-					cout << "YUV4MPEG2 File is wrong ! - Waiting for H" << endl;
-					return false;
-				}
-				cin >> frame_h;
-
-				frame_data = new unsigned char[frame_w*frame_h*3/2];
-				frame_data_unpacked = new unsigned char[frame_w*frame_h*3];
-			}
 			//wait for FRAME
 			string data;
 			while(data != "FRAME")
@@ -154,10 +305,13 @@ class window: public koku::opengl::windowCallback
 			my_window.update();
 			//render stuff and co
 			my_window.begin();
-				glClearColor(1,1,1,1);
+				glClearColor(0,0,0,1);
 				glClear(GL_COLOR_BUFFER_BIT);
 				my_shader.begin();
 					my_shader.set(&my_frame_sampler,  &my_frame);
+					my_shader.set(&my_frame_mode_input, frame_mode_input);
+					my_shader.set(&my_frame_mode_output, frame_mode_output);
+					my_shader.set(&my_frame_ratio, frame_ratio);
 					my_rect.render(3, 6);
 				my_shader.end();
 				my_window.flip();
@@ -169,7 +323,10 @@ class window: public koku::opengl::windowCallback
 int main(int argc, const char** argv)
 {
 	string data;
-	cin >> data;
+	if (argc > 2)
+	{
+		cin >> data;
+	}
 
 	if (data != "YUV4MPEG2")
 	{
@@ -194,8 +351,63 @@ int main(int argc, const char** argv)
 		return 1;
 	}
 
+	int mode_in = 0, mode_out = 0;
 
-	window my_window;
+	if (argc > 2)
+	{
+		string smode_in = argv[1];
+		string smode_out = argv[2];
+
+		if (smode_in == "NONE")
+		{
+			mode_in = 0;
+		}
+		else if (smode_in == "LEFT_RIGHT")
+		{
+			mode_in = 1;
+		}
+		else if (smode_in == "TOP_BOTTOM")
+		{
+			mode_in = 2;
+		}
+		else
+		{
+			//show helpfalse
+			return main(1, argv);
+		}
+
+		if (smode_out == "NONE")
+		{
+			mode_out = 0;
+		}
+		else if (smode_out == "LEFT_RIGHT")
+		{
+			mode_out = 1;
+		}
+		else if (smode_out == "TOP_BOTTOM")
+		{
+			mode_out = 2;
+		}
+		else if (smode_out == "COL")
+		{
+			mode_out = 3;
+		}
+		else if (smode_out == "ROW")
+		{
+			mode_out = 4;
+		}
+		else
+		{
+			//show help
+			return main(1, argv);
+		}
+	}
+	else
+	{
+		return main(1, argv);
+	}
+
+	window my_window(mode_in, mode_out);
 	while(my_window.update())
 	{
 		//wait for data
